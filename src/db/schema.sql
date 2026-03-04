@@ -39,11 +39,9 @@ CREATE TABLE IF NOT EXISTS pokemon_names (
   language    VARCHAR(10)  NOT NULL,
   name        VARCHAR(100) NOT NULL,
   PRIMARY KEY (pokemon_id, language),
-  CONSTRAINT fk_pn_pokemon FOREIGN KEY (pokemon_id) REFERENCES pokemon(id)
+  CONSTRAINT fk_pn_pokemon FOREIGN KEY (pokemon_id) REFERENCES pokemon(id),
+  INDEX idx_pn_name (name)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-
--- Index to speed up case-insensitive name lookups
-CREATE INDEX IF NOT EXISTS idx_pn_name ON pokemon_names (name);
 
 -- Pokémon types per generation (slot 1 or 2)
 CREATE TABLE IF NOT EXISTS pokemon_types (
