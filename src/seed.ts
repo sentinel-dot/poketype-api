@@ -56,6 +56,7 @@ interface PokemonData {
 interface SpeciesName { language: NamedResource; name: string; }
 
 interface SpeciesData {
+  generation: NamedResource;
   names: SpeciesName[];
 }
 
@@ -194,13 +195,12 @@ function buildEffectivenessTable(
 
 /**
  * Returns a map genId -> [type names] for the given Pokémon.
+ * Only includes generations >= introducedGen (the generation the Pokémon debuted in).
  * Rules:
  * - Current types apply from the generation AFTER the last past_types entry.
  * - past_types entries describe types valid up to and including that generation.
- * - For generations before the Pokémon was introduced we still record the
- *   earliest known types (the seed simply stores what the API says).
  */
-function pokemonTypesPerGen(pokemon: PokemonData): Map<number, string[]> {
+function pokemonTypesPerGen(pokemon: PokemonData, introducedGen: number): Map<number, string[]> {
   const result = new Map<number, string[]>();
 
   const currentTypes = pokemon.types.map(t => t.type.name);
@@ -219,7 +219,7 @@ function pokemonTypesPerGen(pokemon: PokemonData): Map<number, string[]> {
     breakpoints.push({ upTo: genId, types: pt.types.map(t => t.type.name) });
   }
 
-  for (let g = 1; g <= TOTAL_GENERATIONS; g++) {
+  for (let g = introducedGen; g <= TOTAL_GENERATIONS; g++) {
     const applicable = breakpoints
       .filter(bp => bp.upTo >= g)
       .sort((a, b) => a.upTo - b.upTo)[0];
@@ -401,8 +401,13 @@ async function seed() {
       }
     }
 
-    // Insert types per generation
-    const typesPerGen = pokemonTypesPerGen(pokemonData);
+    // Determine introduction generation; default to 1 if species fetch failed
+    const introducedGen = speciesData
+      ? (GEN_NAME_TO_ID[speciesData.generation.name] ?? 1)
+      : 1;
+
+    // Insert types per generation (only from introducedGen onwards)
+    const typesPerGen = pokemonTypesPerGen(pokemonData, introducedGen);
     for (const [genId, typeNames] of typesPerGen) {
       for (let slot = 0; slot < typeNames.length; slot++) {
         const typeId = typeIdByName.get(typeNames[slot]);
@@ -424,7 +429,11 @@ async function seed() {
   console.log('\nSeeding complete!');
 }
 
-seed().catch(err => {
-  console.error('Seed failed:', err);
-  process.exit(1);
-});
+export { seed };
+
+if (require.main === module) {
+  seed().catch(err => {
+    console.error('Seed failed:', err);
+    process.exit(1);
+  });
+}

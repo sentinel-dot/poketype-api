@@ -59,9 +59,15 @@ export async function getMatchup(req: Request, res: Response): Promise<void> {
   );
 
   if (typeRows.length === 0) {
-    res.status(404).json({
-      error: `No type data for "${name}" in generation ${gen}. The Pokémon may not exist yet in that generation.`,
-    });
+    const [minGenRows] = await pool.query<TypeRow[]>(
+      `SELECT MIN(generation_id) AS id FROM pokemon_types WHERE pokemon_id = ?`,
+      [pokemon.id],
+    );
+    const introducedGen = minGenRows[0]?.id ?? null;
+    const msg = introducedGen
+      ? `„${name}" existiert erst ab Generation ${introducedGen}.`
+      : `Keine Typdaten für „${name}" in Generation ${gen}.`;
+    res.status(422).json({ error: msg });
     return;
   }
 
@@ -116,6 +122,7 @@ export async function getMatchup(req: Request, res: Response): Promise<void> {
   // ── Calculate final multiplier for each attacking type ───────────────────
   const result: MatchupResponse = {
     pokemon:    displayName,
+    pokemonId:  pokemon.id,
     generation: gen,
     types:      pokeTypes,
     matchup: { '0': [], '0.25': [], '0.5': [], '1': [], '2': [], '4': [] },

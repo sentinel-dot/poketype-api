@@ -1,5 +1,6 @@
 export interface MatchupResponse {
   pokemon:     string;
+  pokemonId?:  number;  // Optional: for frontend image URL (official-artwork/{pokemonId}.png)
   generation:  number;
   types:       string[];
   matchup: {

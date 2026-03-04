@@ -121,6 +121,7 @@ GET /pokemon/Koraidon/matchup?gen=9
 ```json
 {
   "pokemon": "Gengar",
+  "pokemonId": 94,
   "generation": 1,
   "types": ["ghost", "poison"],
   "matchup": {
@@ -178,11 +179,19 @@ Type chart changes are sourced directly from PokéAPI's `past_damage_relations` 
 
 ---
 
+## Frontend
+
+An implementation brief for a React + TypeScript mobile-first frontend (with type icons, Pokémon-themed design, and optional artwork) is in **[docs/FRONTEND_AGENT_BRIEF.md](docs/FRONTEND_AGENT_BRIEF.md)**. Use it to implement the web app or to brief an agent.
+
+---
+
 ## Project structure
 
 ```
 poketype-api/
 ├── .env
+├── docs/
+│   └── FRONTEND_AGENT_BRIEF.md   # Brief for React frontend implementation
 ├── package.json
 ├── tsconfig.json
 └── src/
