@@ -1,4 +1,4 @@
-import express from 'express';
+import express, { NextFunction, Request, Response } from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import { RowDataPacket } from 'mysql2';
@@ -28,6 +28,13 @@ app.get('/health', (_req, res) => {
 // 404 handler
 app.use((_req, res) => {
   res.status(404).json({ error: 'Not found' });
+});
+
+// Global error handler
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+  console.error('Unhandled error:', err);
+  res.status(500).json({ error: 'Internal server error' });
 });
 
 async function startServer() {
