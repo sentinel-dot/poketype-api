@@ -59,14 +59,15 @@ export async function getMatchup(req: Request, res: Response): Promise<void> {
   );
 
   if (typeRows.length === 0) {
-    const [minGenRows] = await pool.query<TypeRow[]>(
+    interface MinGenRow extends RowDataPacket { id: number | null; }
+    const [minGenRows] = await pool.query<MinGenRow[]>(
       `SELECT MIN(generation_id) AS id FROM pokemon_types WHERE pokemon_id = ?`,
       [pokemon.id],
     );
     const introducedGen = minGenRows[0]?.id ?? null;
     const msg = introducedGen
-      ? `„${name}" existiert erst ab Generation ${introducedGen}.`
-      : `Keine Typdaten für „${name}" in Generation ${gen}.`;
+      ? `"${name}" was not introduced until Generation ${introducedGen}.`
+      : `No type data for "${name}" in Generation ${gen}.`;
     res.status(422).json({ error: msg });
     return;
   }

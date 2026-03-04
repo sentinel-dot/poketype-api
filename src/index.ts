@@ -11,9 +11,10 @@ dotenv.config();
 const app  = express();
 const port = parseInt(process.env.PORT ?? '3000');
 
-app.use(cors({
-  origin: ['http://localhost:3000', 'http://192.168.178.31:3000'],
-}));
+const corsOrigins = process.env.CORS_ORIGINS
+  ? process.env.CORS_ORIGINS.split(',').map(s => s.trim())
+  : ['http://localhost:3000'];
+app.use(cors({ origin: corsOrigins }));
 app.use(express.json());
 
 // Routes
@@ -40,8 +41,10 @@ async function startServer() {
     } else {
       console.log(`Database already seeded (${count} Pokémon found).`);
     }
-  } catch {
-    // Table doesn't exist yet (fresh DB) – run seed
+  } catch (err: unknown) {
+    // Only seed if the table doesn't exist yet; re-throw other errors
+    const code = (err as { code?: string }).code;
+    if (code !== 'ER_NO_SUCH_TABLE') throw err;
     console.log('Database not initialized – running seed...');
     await seed();
   }

@@ -168,11 +168,9 @@ function buildEffectivenessTable(
 
     // For each generation, determine which map applies
     for (let g = 1; g <= TOTAL_GENERATIONS; g++) {
-      // Find the applicable breakpoint: the one with the lowest upTo >= g
-      // (i.e. the oldest "past" state that still covers gen g)
-      const applicable = breakpoints
-        .filter(bp => bp.upTo >= g)
-        .sort((a, b) => a.upTo - b.upTo)[0];
+      // Find the applicable breakpoint: the earliest one that covers gen g
+      // (breakpoints is sorted ascending by upTo, so find() returns the minimum)
+      const applicable = breakpoints.find(bp => bp.upTo >= g);
 
       const effMap = applicable ? applicable.map : currentMap;
 
@@ -220,9 +218,7 @@ function pokemonTypesPerGen(pokemon: PokemonData, introducedGen: number): Map<nu
   }
 
   for (let g = introducedGen; g <= TOTAL_GENERATIONS; g++) {
-    const applicable = breakpoints
-      .filter(bp => bp.upTo >= g)
-      .sort((a, b) => a.upTo - b.upTo)[0];
+    const applicable = breakpoints.find(bp => bp.upTo >= g);
 
     result.set(g, applicable ? applicable.types : currentTypes);
   }
