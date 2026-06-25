@@ -1,24 +1,41 @@
 import express, { NextFunction, Request, Response } from 'express';
+import { createServer } from 'http';
+import { Server } from 'socket.io';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import { RowDataPacket } from 'mysql2';
 import pokemonRouter from './routes/pokemon';
+import { createSoulLinkRouter } from './routes/soullink';
+import { registerSoulLinkSocket } from './ws/soullink';
 import pool from './db/connection';
 import { seed } from './seed';
+import { ensureSoulLinkSchema } from './db/migrate';
 
 dotenv.config();
 
 const app  = express();
-const port = parseInt(process.env.PORT ?? '3000');
+const port = parseInt(process.env.PORT ?? '4000');
 
+// In development Next.js occupies 3000, the API runs on 4000 by default.
+// Override with CORS_ORIGINS (comma-separated) in production.
 const corsOrigins = process.env.CORS_ORIGINS
   ? process.env.CORS_ORIGINS.split(',').map(s => s.trim())
-  : ['http://localhost:3000'];
+  : ['http://localhost:3000', 'http://localhost:3001'];
 app.use(cors({ origin: corsOrigins }));
 app.use(express.json());
 
+// HTTP server + Socket.io
+const httpServer = createServer(app);
+const io = new Server(httpServer, {
+  cors: { origin: corsOrigins, methods: ['GET', 'POST'] },
+});
+
 // Routes
 app.use('/pokemon', pokemonRouter);
+app.use('/soullink', createSoulLinkRouter(io));
+
+// WebSocket handlers
+registerSoulLinkSocket(io);
 
 // Health check
 app.get('/health', (_req, res) => {
@@ -56,7 +73,11 @@ async function startServer() {
     await seed();
   }
 
-  app.listen(port, () => {
+  // Ensure SoulLink tables exist (safe to run on every start)
+  await ensureSoulLinkSchema();
+  console.log('SoulLink schema ready.');
+
+  httpServer.listen(port, () => {
     console.log(`Pokétype API listening on port ${port}`);
   });
 }
