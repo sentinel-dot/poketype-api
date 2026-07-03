@@ -29,9 +29,11 @@ export async function searchPokemon(req: Request, res: Response): Promise<void> 
     if (!isNaN(parsed) && parsed > 0) maxDex = parsed;
   }
 
-  const params: (string | number)[] = [`${q}%`];
+  const contains = `%${q}%`;
+  const prefix = `${q}%`;
+  const params: (string | number)[] = [contains, q, prefix];
   const dexFilter = maxDex !== null ? 'AND p.id <= ?' : '';
-  if (maxDex !== null) params.push(maxDex);
+  if (maxDex !== null) params.splice(1, 0, maxDex);
 
   const [rows] = await pool.query<SearchRow[]>(
     `SELECT p.id,
@@ -39,9 +41,16 @@ export async function searchPokemon(req: Request, res: Response): Promise<void> 
        MAX(CASE WHEN pn.language = 'en' THEN pn.name END) AS nameEN
      FROM pokemon p
      JOIN pokemon_names pn ON pn.pokemon_id = p.id
-     WHERE pn.name LIKE ? ${dexFilter}
+     WHERE LOWER(pn.name) LIKE LOWER(?)
+       ${dexFilter}
      GROUP BY p.id
-     ORDER BY p.id
+     ORDER BY
+       MIN(CASE
+         WHEN LOWER(pn.name) = LOWER(?) THEN 0
+         WHEN LOWER(pn.name) LIKE LOWER(?) THEN 1
+         ELSE 2
+       END),
+       p.id
      LIMIT 10`,
     params,
   );
