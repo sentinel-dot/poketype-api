@@ -1,9 +1,15 @@
 import { Server, Socket } from 'socket.io';
 import { RowDataPacket } from 'mysql2';
-import { v4 as uuidv4 } from 'uuid';
 import pool from '../db/connection';
 import { fetchRoomState } from '../controllers/soullink/roomState';
 import { SlotStatus } from '../types';
+import {
+  applySlotUpdate,
+  clearOneSlot,
+  clearAllSlots,
+  adjustDeathCount,
+  VALID_SLOT_STATUSES,
+} from '../controllers/soullink/slotService';
 
 interface SeatRow extends RowDataPacket {
   id: string;
@@ -16,8 +22,6 @@ interface SeatRow extends RowDataPacket {
 // In-memory maps: socketId → { roomCode, seatId } and seatId → Set<socketId>
 const socketToSeat  = new Map<string, { roomCode: string; seatId: string }>();
 const seatToSockets = new Map<string, Set<string>>();
-
-const VALID_STATUSES: SlotStatus[] = ['empty', 'alive', 'dead'];
 
 export function registerSoulLinkSocket(io: Server): void {
   io.on('connection', (socket: Socket) => {
@@ -100,6 +104,9 @@ export function registerSoulLinkSocket(io: Server): void {
             nickname?: string | null;
             level?: number | null;
             status?: string;
+            isShiny?: boolean;
+            encounterLabel?: string | null;
+            route?: string | null;
           };
         };
 
@@ -133,50 +140,31 @@ export function registerSoulLinkSocket(io: Server): void {
 
         const roomId = rows[0].room_id;
 
-        const pid = patch.pokemonId != null ? Number(patch.pokemonId) : null;
-        if (pid !== null && (isNaN(pid) || pid < 1)) {
+        const pid = patch.pokemonId != null ? Number(patch.pokemonId) : (patch.pokemonId === null ? null : undefined);
+        if (pid != null && (isNaN(pid) || pid < 1)) {
           socket.emit('error', { message: 'pokemonId must be a positive integer' });
           return;
         }
 
-        const nick = patch.nickname ? String(patch.nickname).trim().slice(0, 50) : null;
-
-        const lvl = patch.level != null ? Number(patch.level) : null;
-        if (lvl !== null && (isNaN(lvl) || lvl < 1 || lvl > 100)) {
+        const lvl = patch.level != null ? Number(patch.level) : (patch.level === null ? null : undefined);
+        if (lvl != null && (isNaN(lvl) || lvl < 1 || lvl > 100)) {
           socket.emit('error', { message: 'level must be 1–100' });
           return;
         }
 
-        const status = VALID_STATUSES.includes(patch.status as SlotStatus)
+        const status = VALID_SLOT_STATUSES.includes(patch.status as SlotStatus)
           ? (patch.status as SlotStatus)
-          : 'alive';
+          : undefined;
 
-        await pool.query(
-          `INSERT INTO soullink_team_slots (id, room_id, seat_id, slot, pokemon_id, nickname, level, status)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-           ON DUPLICATE KEY UPDATE
-             pokemon_id = VALUES(pokemon_id),
-             nickname   = VALUES(nickname),
-             level      = VALUES(level),
-             status     = VALUES(status),
-             updated_at = NOW()`,
-          [uuidv4(), roomId, seatId, slot, pid, nick, lvl, status],
-        );
-
-        let pokemonName: string | null = null;
-        if (pid !== null) {
-          const [nameRows] = await pool.query<(RowDataPacket & { pokemonName: string | null })[]>(
-            `SELECT COALESCE(pn_de.name, pn_en.name) AS pokemonName
-             FROM pokemon p
-             LEFT JOIN pokemon_names pn_de ON pn_de.pokemon_id = p.id AND pn_de.language = 'de'
-             LEFT JOIN pokemon_names pn_en ON pn_en.pokemon_id = p.id AND pn_en.language = 'en'
-             WHERE p.id = ?`,
-            [pid],
-          );
-          pokemonName = nameRows[0]?.pokemonName ?? null;
-        }
-        const slotData = { pokemonId: pid, nickname: nick, level: lvl, status, pokemonName };
-        io.to(roomCode).emit('team-slot:updated', { seatId, slot, slotData });
+        await applySlotUpdate(io, ownership.roomCode, roomId, seatId, slot, {
+          pokemonId: pid,
+          nickname: patch.nickname === undefined ? undefined : patch.nickname,
+          level: lvl,
+          status,
+          isShiny: patch.isShiny === undefined ? undefined : Boolean(patch.isShiny),
+          encounterLabel: patch.encounterLabel === undefined ? undefined : patch.encounterLabel,
+          route: patch.route === undefined ? undefined : patch.route,
+        });
       } catch (err) {
         console.error('[ws] team-slot:update error:', err);
         socket.emit('error', { message: 'Failed to update slot' });
@@ -208,20 +196,50 @@ export function registerSoulLinkSocket(io: Server): void {
           return;
         }
 
-        await pool.query(
-          `UPDATE soullink_team_slots
-           SET pokemon_id = NULL, nickname = NULL, level = NULL,
-               status = 'empty', updated_at = NOW()
-           WHERE seat_id = ? AND slot = ?`,
-          [seatId, slot],
-        );
-
         // Use the server-tracked roomCode to prevent the client from
         // redirecting the broadcast to a different room.
-        io.to(clearOwnership.roomCode).emit('team-slot:cleared', { seatId, slot });
+        await clearOneSlot(io, clearOwnership.roomCode, seatId, slot);
       } catch (err) {
         console.error('[ws] team-slot:clear error:', err);
         socket.emit('error', { message: 'Failed to clear slot' });
+      }
+    });
+
+    // ── team-slot:clear-all ───────────────────────────────────────────────
+    socket.on('team-slot:clear-all', async (data: unknown) => {
+      try {
+        const { seatId } = (data ?? {}) as { seatId?: string };
+        const ownership = socketToSeat.get(socket.id);
+        if (!ownership || !seatId || ownership.seatId !== seatId) {
+          socket.emit('error', { message: 'You can only clear your own team' });
+          return;
+        }
+        await clearAllSlots(io, ownership.roomCode, seatId);
+      } catch (err) {
+        console.error('[ws] team-slot:clear-all error:', err);
+        socket.emit('error', { message: 'Failed to clear team' });
+      }
+    });
+
+    // ── death:adjust ──────────────────────────────────────────────────────
+    // { seatId, delta: +1 | -1 } — bump a seat's death counter.
+    socket.on('death:adjust', async (data: unknown) => {
+      try {
+        const { seatId, delta } = (data ?? {}) as { seatId?: string; delta?: number };
+        const ownership = socketToSeat.get(socket.id);
+        if (!ownership || !seatId || ownership.seatId !== seatId) {
+          socket.emit('error', { message: 'You can only change your own death counter' });
+          return;
+        }
+        const d = Number(delta);
+        if (d !== 1 && d !== -1) {
+          socket.emit('error', { message: 'delta must be +1 or -1' });
+          return;
+        }
+        await adjustDeathCount(io, ownership.roomCode, seatId, d);
+      } catch (err) {
+        console.error('[ws] death:adjust error:', err);
+        socket.emit('error', { message: 'Failed to update death counter' });
       }
     });
 

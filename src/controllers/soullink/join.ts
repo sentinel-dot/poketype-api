@@ -3,6 +3,7 @@ import { RowDataPacket } from 'mysql2';
 import { Server } from 'socket.io';
 import { v4 as uuidv4 } from 'uuid';
 import pool from '../../db/connection';
+import { AuthedRequest } from '../../middleware/auth';
 
 interface SeatRow extends RowDataPacket {
   id: string;
@@ -21,9 +22,15 @@ interface RoomRow extends RowDataPacket {
 
 export async function joinRoom(req: Request, res: Response): Promise<void> {
   const { roomCode } = req.params as { roomCode: string };
+  const auth = (req as AuthedRequest).auth ?? null;
   const { displayName } = req.body as { displayName?: unknown };
 
-  if (typeof displayName !== 'string' || displayName.trim().length === 0) {
+  // Logged-in users may omit displayName (their username is used instead).
+  const resolvedDisplayName =
+    typeof displayName === 'string' && displayName.trim().length > 0
+      ? displayName.trim().slice(0, 100)
+      : (auth?.username ?? null);
+  if (!resolvedDisplayName) {
     res.status(400).json({ error: 'displayName is required' });
     return;
   }
@@ -40,6 +47,28 @@ export async function joinRoom(req: Request, res: Response): Promise<void> {
   }
 
   const room = roomRows[0];
+
+  // Cross-day resume: a logged-in user who already holds a seat re-enters it
+  // (and keeps yesterday's team) instead of claiming a new one.
+  if (auth) {
+    const [existing] = await pool.query<(SeatRow & { participant_token: string | null })[]>(
+      `SELECT id, position, status, participant_token
+         FROM soullink_seats WHERE room_id = ? AND user_id = ? LIMIT 1`,
+      [room.id, auth.userId],
+    );
+    if (existing.length > 0) {
+      const seat = existing[0];
+      const token = seat.participant_token ?? uuidv4();
+      await pool.query(
+        `UPDATE soullink_seats
+            SET display_name = ?, status = 'joining', participant_token = ?, joined_at = NOW()
+          WHERE id = ?`,
+        [resolvedDisplayName, token, seat.id],
+      );
+      res.status(200).json({ seatId: seat.id, participantToken: token, resumed: true });
+      return;
+    }
+  }
 
   // Use a transaction with SELECT ... FOR UPDATE to prevent two simultaneous
   // join requests from claiming the same seat (race condition).
@@ -68,9 +97,9 @@ export async function joinRoom(req: Request, res: Response): Promise<void> {
 
     await conn.query(
       `UPDATE soullink_seats
-       SET display_name = ?, status = 'joining', participant_token = ?, joined_at = NOW()
+       SET display_name = ?, status = 'joining', participant_token = ?, user_id = ?, joined_at = NOW()
        WHERE id = ?`,
-      [displayName.trim().slice(0, 100), participantToken, seat.id],
+      [resolvedDisplayName, participantToken, auth?.userId ?? null, seat.id],
     );
 
     await conn.commit();
@@ -116,7 +145,7 @@ export async function leaveRoom(req: Request, res: Response, io: Server): Promis
   await pool.query(
     `UPDATE soullink_seats
      SET display_name = NULL, status = 'empty', participant_token = NULL,
-         joined_at = NULL, last_seen_at = NULL
+         user_id = NULL, joined_at = NULL, last_seen_at = NULL
      WHERE id = ?`,
     [seat.id],
   );

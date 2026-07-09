@@ -45,6 +45,23 @@ export const POOL_TO_MAX_DEX: Record<PokemonPool, number | null> = {
 
 export type SeatStatus = 'empty' | 'joining' | 'online' | 'disconnected';
 export type SlotStatus  = 'empty' | 'alive' | 'dead';
+export type EncounterOutcome = 'caught' | 'dead' | 'fled';
+
+/** SoulLink ruleset flags, persisted as JSON on the room. */
+export interface Ruleset {
+  typeClause:   boolean;
+  autoDeadSync: boolean;
+  dupesWarn:    boolean;
+}
+
+/** A species used on a seat, tracked for the dupes-/species-clause. */
+export interface UsedSpecies {
+  familyKey:   number;
+  pokemonId:   number;
+  pokemonName: string | null;
+  outcome:     EncounterOutcome;
+  routeLabel:  string | null;
+}
 
 /**
  * API wire-format shape of a SoulLink room (as returned by GET /soullink/rooms/:code).
@@ -57,7 +74,25 @@ export interface SoulLinkRoom {
   maxPlayers:  number;
   pokemonPool: PokemonPool;
   gameName:    string | null; // DB column: game
+  ownerUserId: string | null; // DB column: owner_user_id
+  badges:      number;
+  levelCap:    number | null; // DB column: level_cap
+  ruleset:     Ruleset;
+  status:      string;        // 'active' | 'archived'
   createdAt:   string;        // ISO 8601 — DATETIME serialised by JSON
+}
+
+/** API wire-format shape of a team slot. */
+export interface SoulLinkTeamSlot {
+  slot:           number;
+  status:         SlotStatus;
+  pokemonId:      number | null;
+  pokemonName:    string | null;
+  nickname:       string | null;
+  level:          number | null;
+  isShiny:        boolean;
+  encounterLabel: string | null;
+  route:          string | null;
 }
 
 /** API wire-format shape of a SoulLink seat. */
@@ -67,15 +102,26 @@ export interface SoulLinkSeat {
   displayName: string | null;
   status:      SeatStatus;
   joinedAt:    string | null; // ISO 8601 or null
+  userId:      string | null; // DB column: user_id
+  deathCount:  number;
   teamSlots:   SoulLinkTeamSlot[];
+  usedSpecies: UsedSpecies[];
 }
 
-/** API wire-format shape of a team slot. */
-export interface SoulLinkTeamSlot {
-  slot:        number;
-  status:      SlotStatus;
-  pokemonId:   number | null;
+/** A dead encounter shown in the room memorial/graveyard. */
+export interface GraveyardEntry {
+  seatId:      string | null;
+  position:    number | null;
+  displayName: string | null;
+  pokemonId:   number;
   pokemonName: string | null;
-  nickname:    string | null;
-  level:       number | null;
+  routeLabel:  string | null;
+  diedAt:      string | null;
+}
+
+/** Full room state as returned by GET /soullink/rooms/:code and the `room:state` WS event. */
+export interface RoomStateResponse {
+  room:      SoulLinkRoom;
+  seats:     SoulLinkSeat[];
+  graveyard: GraveyardEntry[];
 }

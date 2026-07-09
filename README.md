@@ -64,7 +64,7 @@ DB_PORT=3306
 DB_USER=dev
 DB_PASSWORD=devpw
 DB_NAME=poketype
-PORT=3000
+PORT=4000
 ```
 
 **3. Seed the database**

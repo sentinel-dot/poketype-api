@@ -6,7 +6,11 @@ import dotenv from 'dotenv';
 import { RowDataPacket } from 'mysql2';
 import pokemonRouter from './routes/pokemon';
 import { createSoulLinkRouter } from './routes/soullink';
+import { createAuthRouter } from './routes/auth';
+import { createFriendsRouter } from './routes/friends';
+import { createNotificationsRouter } from './routes/notifications';
 import { registerSoulLinkSocket } from './ws/soullink';
+import { registerUserSocket } from './ws/notifications';
 import pool from './db/connection';
 import { seed } from './seed';
 import { ensureSoulLinkSchema } from './db/migrate';
@@ -29,13 +33,19 @@ const httpServer = createServer(app);
 const io = new Server(httpServer, {
   cors: { origin: corsOrigins, methods: ['GET', 'POST'] },
 });
+// Expose io to route handlers (e.g. room settings broadcast) via req.app.get('io')
+app.set('io', io);
 
 // Routes
 app.use('/pokemon', pokemonRouter);
+app.use('/auth', createAuthRouter());
+app.use('/friends', createFriendsRouter(io));
+app.use('/notifications', createNotificationsRouter());
 app.use('/soullink', createSoulLinkRouter(io));
 
 // WebSocket handlers
 registerSoulLinkSocket(io);
+registerUserSocket(io);
 
 // Health check
 app.get('/health', (_req, res) => {
