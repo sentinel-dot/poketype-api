@@ -20,6 +20,11 @@ interface RoomRow extends RowDataPacket {
   game: string | null;
 }
 
+// A 'disconnected' seat (tab closed, network drop, ...) is never told apart
+// from an intentional leave by the client, so we reclaim it for new joiners
+// once it's been stale this long. Real 'empty' seats are always preferred.
+const SEAT_RECLAIM_GRACE_MINUTES = 15;
+
 export async function joinRoom(req: Request, res: Response): Promise<void> {
   const { roomCode } = req.params as { roomCode: string };
   const auth = (req as AuthedRequest).auth ?? null;
@@ -79,11 +84,15 @@ export async function joinRoom(req: Request, res: Response): Promise<void> {
     const [seatRows] = await conn.query<SeatRow[]>(
       `SELECT id, position, status
        FROM soullink_seats
-       WHERE room_id = ? AND status = 'empty' AND display_name IS NULL
-       ORDER BY position
+       WHERE room_id = ?
+         AND (
+           (status = 'empty' AND display_name IS NULL)
+           OR (status = 'disconnected' AND last_seen_at < NOW() - INTERVAL ? MINUTE)
+         )
+       ORDER BY CASE WHEN status = 'empty' THEN 0 ELSE 1 END, position
        LIMIT 1
        FOR UPDATE`,
-      [room.id],
+      [room.id, SEAT_RECLAIM_GRACE_MINUTES],
     );
 
     if (seatRows.length === 0) {
@@ -94,6 +103,11 @@ export async function joinRoom(req: Request, res: Response): Promise<void> {
 
     const seat = seatRows[0];
     const participantToken = uuidv4();
+
+    if (seat.status === 'disconnected') {
+      // Reclaiming an abandoned seat — wipe its previous occupant's team.
+      await conn.query(`DELETE FROM soullink_team_slots WHERE seat_id = ?`, [seat.id]);
+    }
 
     await conn.query(
       `UPDATE soullink_seats
