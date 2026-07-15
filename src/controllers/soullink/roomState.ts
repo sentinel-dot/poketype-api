@@ -1,7 +1,7 @@
 import { RowDataPacket } from 'mysql2';
 import pool from '../../db/connection';
 import { PokemonPool, SeatStatus, SlotStatus } from '../../types';
-import { fetchUsedSpeciesBySeat, UsedSpecies } from './encounters';
+import { fetchRoutes, fetchRoomEncounters, RouteEntry, EncounterState } from './encounters';
 
 interface RoomRow extends RowDataPacket {
   id: string;
@@ -69,7 +69,6 @@ export interface SeatState {
   userId: string | null;
   deathCount: number;
   teamSlots: TeamSlotState[];
-  usedSpecies: UsedSpecies[];
 }
 
 export interface Ruleset {
@@ -111,6 +110,8 @@ export interface RoomState {
   };
   seats: SeatState[];
   graveyard: GraveyardEntry[];
+  routes: RouteEntry[];
+  encounters: EncounterState[];
 }
 
 function parseRuleset(raw: unknown): Ruleset {
@@ -168,8 +169,6 @@ export async function fetchRoomState(roomCode: string): Promise<RoomState | null
     [room.id],
   );
 
-  const usedBySeat = await fetchUsedSpeciesBySeat(room.id);
-
   const seatsMap = new Map<string, SeatState>();
 
   for (const row of rows) {
@@ -183,7 +182,6 @@ export async function fetchRoomState(roomCode: string): Promise<RoomState | null
         userId: row.userId,
         deathCount: row.deathCount ?? 0,
         teamSlots: [],
-        usedSpecies: usedBySeat.get(row.seatId) ?? [],
       });
     }
 
@@ -225,6 +223,11 @@ export async function fetchRoomState(roomCode: string): Promise<RoomState | null
     diedAt: g.diedAt instanceof Date ? g.diedAt.toISOString() : (g.diedAt ?? null),
   }));
 
+  const [routes, encounters] = await Promise.all([
+    fetchRoutes(room.id),
+    fetchRoomEncounters(room.id),
+  ]);
+
   return {
     room: {
       id: room.id,
@@ -242,5 +245,7 @@ export async function fetchRoomState(roomCode: string): Promise<RoomState | null
     },
     seats,
     graveyard,
+    routes,
+    encounters,
   };
 }

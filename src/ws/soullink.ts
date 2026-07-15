@@ -1,7 +1,16 @@
 import { Server, Socket } from 'socket.io';
-import { RowDataPacket } from 'mysql2';
+import { RowDataPacket, ResultSetHeader } from 'mysql2';
 import pool from '../db/connection';
 import { fetchRoomState } from '../controllers/soullink/roomState';
+import { resetSeat } from '../controllers/soullink/join';
+import {
+  addRoute,
+  renameRoute,
+  deleteRoute,
+  reorderRoutes,
+  setEncounter,
+  clearEncounter,
+} from '../controllers/soullink/encounters';
 import { SlotStatus } from '../types';
 import {
   applySlotUpdate,
@@ -17,11 +26,29 @@ interface SeatRow extends RowDataPacket {
   position: number;
   display_name: string | null;
   status: string;
+  user_id: string | null;
+  owner_user_id: string | null;
 }
 
-// In-memory maps: socketId → { roomCode, seatId } and seatId → Set<socketId>
-const socketToSeat  = new Map<string, { roomCode: string; seatId: string }>();
+// In-memory maps: socketId → seat context and seatId → Set<socketId>.
+// `isOwner` lets the room creator write to every seat (admin control).
+interface SocketSeat { roomCode: string; roomId: string; seatId: string; isOwner: boolean; }
+const socketToSeat  = new Map<string, SocketSeat>();
 const seatToSockets = new Map<string, Set<string>>();
+
+/** True when the socket owns the target seat OR is the room admin (owner). */
+function canWriteSeat(ownership: SocketSeat | undefined, seatId: string): boolean {
+  return !!ownership && (ownership.seatId === seatId || ownership.isOwner);
+}
+
+/** Confirms a seat belongs to the given room (guards admin cross-seat writes). */
+async function seatInRoom(seatId: string, roomId: string): Promise<boolean> {
+  const [rows] = await pool.query<RowDataPacket[]>(
+    `SELECT 1 FROM soullink_seats WHERE id = ? AND room_id = ? LIMIT 1`,
+    [seatId, roomId],
+  );
+  return rows.length > 0;
+}
 
 export function registerSoulLinkSocket(io: Server): void {
   io.on('connection', (socket: Socket) => {
@@ -40,7 +67,8 @@ export function registerSoulLinkSocket(io: Server): void {
         }
 
         const [rows] = await pool.query<SeatRow[]>(
-          `SELECT s.id, s.room_id, s.position, s.display_name, s.status
+          `SELECT s.id, s.room_id, s.position, s.display_name, s.status,
+                  s.user_id, r.owner_user_id
            FROM soullink_seats s
            JOIN soullink_rooms r ON r.id = s.room_id
            WHERE r.code = ? AND s.participant_token = ?`,
@@ -56,6 +84,7 @@ export function registerSoulLinkSocket(io: Server): void {
         // 'joining' = first WS connect after HTTP create/join (no slots yet)
         // anything else = reconnect after disconnect or server restart → preserve slots
         const wasDisconnected = seat.status !== 'joining';
+        const isOwner = !!seat.owner_user_id && seat.owner_user_id === seat.user_id;
 
         // Update seat to online
         await pool.query(
@@ -65,7 +94,7 @@ export function registerSoulLinkSocket(io: Server): void {
 
         // Join the Socket.io room and track socket→seat + seat→sockets
         socket.join(roomCode);
-        socketToSeat.set(socket.id, { roomCode, seatId: seat.id });
+        socketToSeat.set(socket.id, { roomCode, roomId: seat.room_id, seatId: seat.id, isOwner });
         if (!seatToSockets.has(seat.id)) seatToSockets.set(seat.id, new Set());
         seatToSockets.get(seat.id)!.add(socket.id);
 
@@ -119,26 +148,20 @@ export function registerSoulLinkSocket(io: Server): void {
           return;
         }
 
-        // Verify the socket owns this seat
+        // Own seat, or the room admin editing any seat.
         const ownership = socketToSeat.get(socket.id);
-        if (!ownership || ownership.seatId !== seatId) {
+        if (!canWriteSeat(ownership, seatId)) {
           socket.emit('error', { message: 'You can only update your own slots' });
           return;
         }
 
-        // Verify seat is in this room
-        const [rows] = await pool.query<(RowDataPacket & { room_id: string })[]>(
-          `SELECT s.room_id FROM soullink_seats s
-           JOIN soullink_rooms r ON r.id = s.room_id
-           WHERE r.code = ? AND s.id = ?`,
-          [roomCode, seatId],
-        );
-        if (rows.length === 0) {
+        // Verify the target seat lives in the socket's tracked room (prevents
+        // an admin from redirecting a write to a seat in a different room).
+        if (!(await seatInRoom(seatId, ownership!.roomId))) {
           socket.emit('error', { message: 'Seat not found in this room' });
           return;
         }
-
-        const roomId = rows[0].room_id;
+        const roomId = ownership!.roomId;
 
         const pid = patch.pokemonId != null ? Number(patch.pokemonId) : (patch.pokemonId === null ? null : undefined);
         if (pid != null && (isNaN(pid) || pid < 1)) {
@@ -156,7 +179,7 @@ export function registerSoulLinkSocket(io: Server): void {
           ? (patch.status as SlotStatus)
           : undefined;
 
-        await applySlotUpdate(io, ownership.roomCode, roomId, seatId, slot, {
+        await applySlotUpdate(io, ownership!.roomCode, roomId, seatId, slot, {
           pokemonId: pid,
           nickname: patch.nickname === undefined ? undefined : patch.nickname,
           level: lvl,
@@ -189,16 +212,20 @@ export function registerSoulLinkSocket(io: Server): void {
           return;
         }
 
-        // Verify the socket owns this seat
+        // Own seat, or the room admin editing any seat.
         const clearOwnership = socketToSeat.get(socket.id);
-        if (!clearOwnership || clearOwnership.seatId !== seatId) {
+        if (!canWriteSeat(clearOwnership, seatId)) {
           socket.emit('error', { message: 'You can only clear your own slots' });
+          return;
+        }
+        if (!(await seatInRoom(seatId, clearOwnership!.roomId))) {
+          socket.emit('error', { message: 'Seat not found in this room' });
           return;
         }
 
         // Use the server-tracked roomCode to prevent the client from
         // redirecting the broadcast to a different room.
-        await clearOneSlot(io, clearOwnership.roomCode, seatId, slot);
+        await clearOneSlot(io, clearOwnership!.roomCode, seatId, slot);
       } catch (err) {
         console.error('[ws] team-slot:clear error:', err);
         socket.emit('error', { message: 'Failed to clear slot' });
@@ -210,11 +237,15 @@ export function registerSoulLinkSocket(io: Server): void {
       try {
         const { seatId } = (data ?? {}) as { seatId?: string };
         const ownership = socketToSeat.get(socket.id);
-        if (!ownership || !seatId || ownership.seatId !== seatId) {
+        if (!seatId || !canWriteSeat(ownership, seatId)) {
           socket.emit('error', { message: 'You can only clear your own team' });
           return;
         }
-        await clearAllSlots(io, ownership.roomCode, seatId);
+        if (!(await seatInRoom(seatId, ownership!.roomId))) {
+          socket.emit('error', { message: 'Seat not found in this room' });
+          return;
+        }
+        await clearAllSlots(io, ownership!.roomCode, seatId);
       } catch (err) {
         console.error('[ws] team-slot:clear-all error:', err);
         socket.emit('error', { message: 'Failed to clear team' });
@@ -227,7 +258,7 @@ export function registerSoulLinkSocket(io: Server): void {
       try {
         const { seatId, delta } = (data ?? {}) as { seatId?: string; delta?: number };
         const ownership = socketToSeat.get(socket.id);
-        if (!ownership || !seatId || ownership.seatId !== seatId) {
+        if (!seatId || !canWriteSeat(ownership, seatId)) {
           socket.emit('error', { message: 'You can only change your own death counter' });
           return;
         }
@@ -236,10 +267,207 @@ export function registerSoulLinkSocket(io: Server): void {
           socket.emit('error', { message: 'delta must be +1 or -1' });
           return;
         }
-        await adjustDeathCount(io, ownership.roomCode, seatId, d);
+        if (!(await seatInRoom(seatId, ownership!.roomId))) {
+          socket.emit('error', { message: 'Seat not found in this room' });
+          return;
+        }
+        await adjustDeathCount(io, ownership!.roomCode, seatId, d);
       } catch (err) {
         console.error('[ws] death:adjust error:', err);
         socket.emit('error', { message: 'Failed to update death counter' });
+      }
+    });
+
+    // ── room:kick ─────────────────────────────────────────────────────────
+    // { seatId } — admin-only: fully reset another player's seat and evict
+    // their live sockets.
+    socket.on('room:kick', async (data: unknown) => {
+      try {
+        const { seatId } = (data ?? {}) as { seatId?: string };
+        const ownership = socketToSeat.get(socket.id);
+        if (!ownership || !ownership.isOwner) {
+          socket.emit('error', { message: 'Only the room admin can remove players' });
+          return;
+        }
+        if (!seatId || seatId === ownership.seatId) {
+          socket.emit('error', { message: 'Invalid seat to remove' });
+          return;
+        }
+        if (!(await seatInRoom(seatId, ownership.roomId))) {
+          socket.emit('error', { message: 'Seat not found in this room' });
+          return;
+        }
+
+        await resetSeat(seatId);
+
+        // Evict the kicked player's live sockets so their client clears its
+        // stale credentials and leaves the room.
+        const targetSockets = seatToSockets.get(seatId);
+        if (targetSockets) {
+          for (const sid of targetSockets) {
+            io.to(sid).emit('seat:kicked', { seatId });
+            socketToSeat.delete(sid);
+          }
+          seatToSockets.delete(seatId);
+        }
+
+        io.to(ownership.roomCode).emit('seat:left', { seatId });
+      } catch (err) {
+        console.error('[ws] room:kick error:', err);
+        socket.emit('error', { message: 'Failed to remove player' });
+      }
+    });
+
+    // ── route:add ─────────────────────────────────────────────────────────
+    // { label } — any participant can add a route to the encounter matrix.
+    socket.on('route:add', async (data: unknown) => {
+      try {
+        const { label } = (data ?? {}) as { label?: string };
+        const ownership = socketToSeat.get(socket.id);
+        if (!ownership) {
+          socket.emit('error', { message: 'Join the room first' });
+          return;
+        }
+        if (typeof label !== 'string' || !label.trim()) {
+          socket.emit('error', { message: 'Route label is required' });
+          return;
+        }
+        await addRoute(io, ownership.roomCode, ownership.roomId, label);
+      } catch (err) {
+        console.error('[ws] route:add error:', err);
+        socket.emit('error', { message: 'Failed to add route' });
+      }
+    });
+
+    // ── route:rename / route:delete / route:reorder (admin only) ────────────
+    socket.on('route:rename', async (data: unknown) => {
+      try {
+        const { routeId, label } = (data ?? {}) as { routeId?: string; label?: string };
+        const ownership = socketToSeat.get(socket.id);
+        if (!ownership || !ownership.isOwner) {
+          socket.emit('error', { message: 'Only the room admin can edit routes' });
+          return;
+        }
+        if (!routeId || typeof label !== 'string' || !label.trim()) {
+          socket.emit('error', { message: 'routeId and label are required' });
+          return;
+        }
+        await renameRoute(io, ownership.roomCode, ownership.roomId, routeId, label);
+      } catch (err) {
+        console.error('[ws] route:rename error:', err);
+        socket.emit('error', { message: 'Failed to rename route' });
+      }
+    });
+
+    socket.on('route:delete', async (data: unknown) => {
+      try {
+        const { routeId } = (data ?? {}) as { routeId?: string };
+        const ownership = socketToSeat.get(socket.id);
+        if (!ownership || !ownership.isOwner) {
+          socket.emit('error', { message: 'Only the room admin can delete routes' });
+          return;
+        }
+        if (!routeId) {
+          socket.emit('error', { message: 'routeId is required' });
+          return;
+        }
+        await deleteRoute(io, ownership.roomCode, ownership.roomId, routeId);
+      } catch (err) {
+        console.error('[ws] route:delete error:', err);
+        socket.emit('error', { message: 'Failed to delete route' });
+      }
+    });
+
+    socket.on('route:reorder', async (data: unknown) => {
+      try {
+        const { orderedIds } = (data ?? {}) as { orderedIds?: unknown };
+        const ownership = socketToSeat.get(socket.id);
+        if (!ownership || !ownership.isOwner) {
+          socket.emit('error', { message: 'Only the room admin can reorder routes' });
+          return;
+        }
+        if (!Array.isArray(orderedIds) || orderedIds.some((id) => typeof id !== 'string')) {
+          socket.emit('error', { message: 'orderedIds must be a string array' });
+          return;
+        }
+        await reorderRoutes(io, ownership.roomCode, ownership.roomId, orderedIds as string[]);
+      } catch (err) {
+        console.error('[ws] route:reorder error:', err);
+        socket.emit('error', { message: 'Failed to reorder routes' });
+      }
+    });
+
+    // ── encounter:set ───────────────────────────────────────────────────────
+    // { seatId, routeId, patch } — upsert a matrix cell (own seat or admin).
+    socket.on('encounter:set', async (data: unknown) => {
+      try {
+        const { seatId, routeId, patch } = (data ?? {}) as {
+          seatId?: string;
+          routeId?: string;
+          patch?: {
+            pokemonId?: number;
+            outcome?: string;
+            nickname?: string | null;
+            level?: number | null;
+            isShiny?: boolean;
+          };
+        };
+        const ownership = socketToSeat.get(socket.id);
+        if (!seatId || !canWriteSeat(ownership, seatId)) {
+          socket.emit('error', { message: 'You can only edit your own encounters' });
+          return;
+        }
+        if (!routeId || !patch || patch.pokemonId == null) {
+          socket.emit('error', { message: 'routeId and patch.pokemonId are required' });
+          return;
+        }
+        const pid = Number(patch.pokemonId);
+        if (isNaN(pid) || pid < 1) {
+          socket.emit('error', { message: 'pokemonId must be a positive integer' });
+          return;
+        }
+        if (!(await seatInRoom(seatId, ownership!.roomId))) {
+          socket.emit('error', { message: 'Seat not found in this room' });
+          return;
+        }
+        const outcome =
+          patch.outcome === 'dead' || patch.outcome === 'fled' || patch.outcome === 'caught'
+            ? (patch.outcome as 'dead' | 'fled' | 'caught')
+            : undefined;
+        await setEncounter(io, ownership!.roomCode, ownership!.roomId, seatId, routeId, {
+          pokemonId: pid,
+          outcome,
+          nickname: patch.nickname === undefined ? undefined : patch.nickname,
+          level: patch.level === undefined ? undefined : patch.level,
+          isShiny: patch.isShiny === undefined ? undefined : Boolean(patch.isShiny),
+        });
+      } catch (err) {
+        console.error('[ws] encounter:set error:', err);
+        socket.emit('error', { message: 'Failed to save encounter' });
+      }
+    });
+
+    // ── encounter:clear ─────────────────────────────────────────────────────
+    socket.on('encounter:clear', async (data: unknown) => {
+      try {
+        const { seatId, routeId } = (data ?? {}) as { seatId?: string; routeId?: string };
+        const ownership = socketToSeat.get(socket.id);
+        if (!seatId || !canWriteSeat(ownership, seatId)) {
+          socket.emit('error', { message: 'You can only edit your own encounters' });
+          return;
+        }
+        if (!routeId) {
+          socket.emit('error', { message: 'routeId is required' });
+          return;
+        }
+        if (!(await seatInRoom(seatId, ownership!.roomId))) {
+          socket.emit('error', { message: 'Seat not found in this room' });
+          return;
+        }
+        await clearEncounter(io, ownership!.roomCode, ownership!.roomId, seatId, routeId);
+      } catch (err) {
+        console.error('[ws] encounter:clear error:', err);
+        socket.emit('error', { message: 'Failed to clear encounter' });
       }
     });
 
@@ -261,14 +489,22 @@ export function registerSoulLinkSocket(io: Server): void {
           seatToSockets.delete(seatId);
         }
 
-        await pool.query(
+        // Guard: never resurrect a seat that was intentionally left. A leave
+        // (or kick) nulls the participant_token and sets status='empty'; the
+        // socket then unmounts and fires this handler on the SAME seat id.
+        // Without this guard the just-emptied seat flips back to 'disconnected'
+        // with a NULL token — unreconnectable and blocking the room until the
+        // reclaim grace expires.
+        const [updated] = await pool.query<ResultSetHeader>(
           `UPDATE soullink_seats
            SET status = 'disconnected', last_seen_at = NOW()
-           WHERE id = ?`,
+           WHERE id = ? AND participant_token IS NOT NULL AND status <> 'empty'`,
           [seatId],
         );
 
-        io.to(roomCode).emit('seat:disconnected', { seatId });
+        if (updated.affectedRows > 0) {
+          io.to(roomCode).emit('seat:disconnected', { seatId });
+        }
       } catch (err) {
         console.error('[ws] disconnect error:', err);
       }

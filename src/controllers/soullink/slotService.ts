@@ -3,7 +3,6 @@ import { RowDataPacket } from 'mysql2';
 import { v4 as uuidv4 } from 'uuid';
 import pool from '../../db/connection';
 import { SlotStatus } from '../../types';
-import { recordEncounter } from './encounters';
 import { Ruleset, DEFAULT_RULESET } from './roomState';
 
 export const VALID_SLOT_STATUSES: SlotStatus[] = ['empty', 'alive', 'dead'];
@@ -131,75 +130,10 @@ export async function applySlotUpdate(
 
   const name = pid !== null ? await pokemonName(pid) : null;
 
-  // Dupes registry: record the caught species, or mark it dead.
-  if (pid !== null) {
-    if (status === 'dead') {
-      const used = await recordEncounter(roomId, seatId, pid, 'dead', route, name);
-      io.to(roomCode).emit('encounter:added', { seatId, used });
-    } else {
-      const used = await recordEncounter(roomId, seatId, pid, 'caught', route, name);
-      io.to(roomCode).emit('encounter:added', { seatId, used });
-    }
-  }
-
   const slotData: SlotData = { pokemonId: pid, nickname: nick, level: lvl, status, pokemonName: name, isShiny, encounterLabel, route };
   io.to(roomCode).emit('team-slot:updated', { seatId, slot, slotData });
 
-  // Auto-dead-sync: a linked death drags the same slot of the other seats down.
-  if (justDied) {
-    const ruleset = await fetchRuleset(roomId);
-    if (ruleset.autoDeadSync) {
-      await syncLinkedDeaths(io, roomCode, roomId, seatId, slot, route);
-    }
-  }
-
   return slotData;
-}
-
-/**
- * Marks the same slot index in every OTHER seat of the room as dead (if it
- * holds a living pokémon), records the deaths, and emits the updates.
- */
-async function syncLinkedDeaths(
-  io: Server,
-  roomCode: string,
-  roomId: string,
-  sourceSeatId: string,
-  slot: number,
-  route: string | null,
-): Promise<void> {
-  const [rows] = await pool.query<(RowDataPacket & {
-    seat_id: string; pokemon_id: number | null; status: SlotStatus;
-  })[]>(
-    `SELECT seat_id, pokemon_id, status
-       FROM soullink_team_slots
-      WHERE room_id = ? AND slot = ? AND seat_id <> ? AND pokemon_id IS NOT NULL AND status <> 'dead'`,
-    [roomId, slot, sourceSeatId],
-  );
-
-  for (const r of rows) {
-    await pool.query(
-      `UPDATE soullink_team_slots
-          SET status = 'dead', died_at = NOW(), died_route = COALESCE(?, died_route), updated_at = NOW()
-        WHERE seat_id = ? AND slot = ?`,
-      [route, r.seat_id, slot],
-    );
-    const name = r.pokemon_id !== null ? await pokemonName(r.pokemon_id) : null;
-    if (r.pokemon_id !== null) {
-      const used = await recordEncounter(roomId, r.seat_id, r.pokemon_id, 'dead', route, name);
-      io.to(roomCode).emit('encounter:added', { seatId: r.seat_id, used });
-    }
-    io.to(roomCode).emit('team-slot:updated', {
-      seatId: r.seat_id,
-      slot,
-      slotData: { pokemonId: r.pokemon_id, status: 'dead', pokemonName: name } as Partial<SlotData>,
-      linkedDeath: true,
-    });
-  }
-
-  if (rows.length > 0) {
-    io.to(roomCode).emit('slot:link-dead', { slot });
-  }
 }
 
 /** Clears one slot (keeps the dead encounter in the registry). */

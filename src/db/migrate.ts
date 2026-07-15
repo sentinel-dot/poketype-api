@@ -36,6 +36,22 @@ async function addIndexIfMissing(table: string, indexName: string, definition: s
 }
 
 /**
+ * Idempotently drops an index only if it exists.
+ */
+async function dropIndexIfExists(table: string, indexName: string): Promise<void> {
+  const [rows] = await pool.query<RowDataPacket[]>(
+    `SELECT COUNT(*) AS c
+       FROM information_schema.STATISTICS
+      WHERE TABLE_SCHEMA = DATABASE()
+        AND TABLE_NAME = ?
+        AND INDEX_NAME = ?`,
+    [table, indexName],
+  );
+  if ((rows[0]?.c as number) === 0) return;
+  await pool.query(`ALTER TABLE ${table} DROP INDEX ${indexName}`);
+}
+
+/**
  * Ensures all SoulLink + account tables exist and are up to date.
  * Safe to call on every server start (CREATE ... IF NOT EXISTS + guarded ALTERs).
  */
@@ -185,4 +201,65 @@ export async function ensureSoulLinkSchema(): Promise<void> {
 
   await addIndexIfMissing('soullink_rooms', 'idx_room_owner', 'INDEX idx_room_owner (owner_user_id)');
   await addIndexIfMissing('soullink_seats', 'idx_seat_user',  'INDEX idx_seat_user (user_id)');
+
+  // ─── Central encounter matrix (Route × Player, the nuzlocke tracker) ──────────
+  // Ordered list of routes/locations per room; the rows of the matrix.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS soullink_routes (
+      id         VARCHAR(36)  NOT NULL,
+      room_id    VARCHAR(36)  NOT NULL,
+      label      VARCHAR(100) NOT NULL,
+      position   INT          NOT NULL DEFAULT 0,
+      created_at DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_route_room_label (room_id, label),
+      INDEX idx_route_room (room_id, position),
+      CONSTRAINT fk_route_room FOREIGN KEY (room_id) REFERENCES soullink_rooms(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+  `);
+
+  // Encounters become route-centric: one row per (room, seat, route). The
+  // dupes clause is derived from family_key; full nuzlocke data lives here.
+  await addColumnIfMissing('soullink_encounters', 'route_id', 'VARCHAR(36) NULL');
+  await addColumnIfMissing('soullink_encounters', 'nickname', 'VARCHAR(50) NULL');
+  await addColumnIfMissing('soullink_encounters', 'level',    'INT NULL');
+  await addColumnIfMissing('soullink_encounters', 'is_shiny', 'TINYINT(1) NOT NULL DEFAULT 0');
+
+  // Backfill routes from existing distinct route_labels, then link encounters.
+  await pool.query(`
+    INSERT IGNORE INTO soullink_routes (id, room_id, label, position)
+    SELECT UUID(), room_id, route_label, 0
+      FROM soullink_encounters
+     WHERE route_label IS NOT NULL AND route_label <> '' AND route_id IS NULL
+     GROUP BY room_id, route_label
+  `);
+  await pool.query(`
+    UPDATE soullink_encounters e
+      JOIN soullink_routes r ON r.room_id = e.room_id AND r.label = e.route_label
+       SET e.route_id = r.id
+     WHERE e.route_id IS NULL AND e.route_label IS NOT NULL AND e.route_label <> ''
+  `);
+
+  // Old data allowed several families per (seat, route); the new model is one
+  // encounter per (seat, route). Dedupe before the unique index or it errors.
+  await pool.query(`
+    DELETE e1 FROM soullink_encounters e1
+      JOIN soullink_encounters e2
+        ON e1.room_id = e2.room_id AND e1.seat_id = e2.seat_id
+       AND e1.route_id = e2.route_id AND e1.route_id IS NOT NULL
+       AND e1.id > e2.id
+  `);
+
+  // Swap the unique constraint from (room, seat, family) to (room, seat, route).
+  await dropIndexIfExists('soullink_encounters', 'uq_enc_seat_family');
+  await addIndexIfMissing(
+    'soullink_encounters',
+    'uq_enc_seat_route',
+    'UNIQUE KEY uq_enc_seat_route (room_id, seat_id, route_id)',
+  );
+  await addIndexIfMissing(
+    'soullink_encounters',
+    'idx_enc_family',
+    'INDEX idx_enc_family (room_id, seat_id, family_key)',
+  );
 }

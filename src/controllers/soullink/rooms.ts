@@ -28,17 +28,21 @@ async function uniqueRoomCode(): Promise<string> {
 
 export async function createRoom(req: Request, res: Response): Promise<void> {
   const auth = (req as AuthedRequest).auth ?? null;
-  const { name, pokemonPool, gameName, displayName } = req.body as {
+  const { name, pokemonPool, gameName, displayName, maxPlayers } = req.body as {
     name?: unknown;
     pokemonPool?: unknown;
     gameName?: unknown;
     displayName?: unknown;
+    maxPlayers?: unknown;
   };
 
   if (typeof name !== 'string' || name.trim().length === 0) {
     res.status(400).json({ error: 'name is required' });
     return;
   }
+
+  // Room size: 2 or 3 players (default 3). One fixed seat is created per slot.
+  const seatCount = Number(maxPlayers) === 2 ? 2 : 3;
   // A logged-in host may skip displayName (their username is used instead).
   const resolvedDisplayName =
     typeof displayName === 'string' && displayName.trim().length > 0
@@ -64,13 +68,13 @@ export async function createRoom(req: Request, res: Response): Promise<void> {
 
   await pool.query(
     `INSERT INTO soullink_rooms (id, code, name, max_players, pokemon_pool, game, owner_user_id, ruleset)
-     VALUES (?, ?, ?, 3, ?, ?, ?, ?)`,
-    [roomId, code, name.trim().slice(0, 200), pool_val, game_val, auth?.userId ?? null, JSON.stringify(DEFAULT_RULESET)],
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [roomId, code, name.trim().slice(0, 200), seatCount, pool_val, game_val, auth?.userId ?? null, JSON.stringify(DEFAULT_RULESET)],
   );
 
-  // Create the 3 fixed seats
-  const seatIds = [uuidv4(), uuidv4(), uuidv4()];
-  for (let i = 0; i < 3; i++) {
+  // Create the fixed seats (one per player slot)
+  const seatIds = Array.from({ length: seatCount }, () => uuidv4());
+  for (let i = 0; i < seatCount; i++) {
     await pool.query(
       `INSERT INTO soullink_seats (id, room_id, position) VALUES (?, ?, ?)`,
       [seatIds[i], roomId, i + 1],

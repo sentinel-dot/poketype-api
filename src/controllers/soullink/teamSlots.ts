@@ -1,8 +1,8 @@
 import { Request, Response } from 'express';
-import { RowDataPacket } from 'mysql2';
 import { Server } from 'socket.io';
-import pool from '../../db/connection';
 import { SlotStatus } from '../../types';
+import { AuthedRequest } from '../../middleware/auth';
+import { resolveSeatWriteAccess } from './access';
 import {
   applySlotUpdate,
   clearOneSlot,
@@ -11,26 +11,19 @@ import {
   VALID_SLOT_STATUSES,
 } from './slotService';
 
-interface SeatRow extends RowDataPacket { id: string; room_id: string; }
-
 /**
- * Validates that the seat belongs to the given room AND that the caller
- * holds the correct participantToken.  Returns the room_id on success, null
- * when the seat is not found or the token does not match.
+ * Validates write access to a seat: the caller must hold the seat's
+ * participantToken OR be the authenticated room owner. Returns the room_id on
+ * success, null otherwise.
  */
-async function validateSeatOwnership(
+function validateSeatOwnership(
+  req: Request,
   roomCode: string,
   seatId: string,
-  participantToken: string,
+  participantToken: string | null,
 ): Promise<string | null> {
-  const [rows] = await pool.query<SeatRow[]>(
-    `SELECT s.id, s.room_id
-     FROM soullink_seats s
-     JOIN soullink_rooms r ON r.id = s.room_id
-     WHERE r.code = ? AND s.id = ? AND s.participant_token = ?`,
-    [roomCode, seatId, participantToken],
-  );
-  return rows.length > 0 ? rows[0].room_id : null;
+  const authUserId = (req as AuthedRequest).auth?.userId ?? null;
+  return resolveSeatWriteAccess(roomCode, seatId, participantToken, authUserId);
 }
 
 export async function updateSlot(req: Request, res: Response, io: Server): Promise<void> {
@@ -53,12 +46,13 @@ export async function updateSlot(req: Request, res: Response, io: Server): Promi
     participantToken?: unknown;
   };
 
-  if (typeof participantToken !== 'string' || participantToken.trim().length === 0) {
-    res.status(401).json({ error: 'participantToken is required' });
+  const token = typeof participantToken === 'string' && participantToken.trim().length > 0 ? participantToken : null;
+  if (!token && !(req as AuthedRequest).auth) {
+    res.status(401).json({ error: 'participantToken or admin authentication is required' });
     return;
   }
 
-  const roomId = await validateSeatOwnership(roomCode, seatId, participantToken);
+  const roomId = await validateSeatOwnership(req, roomCode, seatId, token);
   if (!roomId) {
     res.status(403).json({ error: 'Forbidden: invalid token or seat not found in this room' });
     return;
@@ -103,16 +97,17 @@ export async function clearSlot(req: Request, res: Response, io: Server): Promis
     return;
   }
 
-  const ptok =
+  const ptokRaw =
     (req.body as { participantToken?: unknown }).participantToken ??
     req.query['participantToken'];
+  const token = typeof ptokRaw === 'string' && ptokRaw.trim().length > 0 ? ptokRaw : null;
 
-  if (typeof ptok !== 'string' || ptok.trim().length === 0) {
-    res.status(401).json({ error: 'participantToken is required' });
+  if (!token && !(req as AuthedRequest).auth) {
+    res.status(401).json({ error: 'participantToken or admin authentication is required' });
     return;
   }
 
-  const roomId = await validateSeatOwnership(roomCode, seatId, ptok);
+  const roomId = await validateSeatOwnership(req, roomCode, seatId, token);
   if (!roomId) {
     res.status(403).json({ error: 'Forbidden: invalid token or seat not found in this room' });
     return;
@@ -125,16 +120,17 @@ export async function clearSlot(req: Request, res: Response, io: Server): Promis
 /** DELETE /rooms/:roomCode/seats/:seatId/team — wipe the whole team bar. */
 export async function clearAllSlots(req: Request, res: Response, io: Server): Promise<void> {
   const { roomCode, seatId } = req.params as { roomCode: string; seatId: string };
-  const ptok =
+  const ptokRaw =
     (req.body as { participantToken?: unknown }).participantToken ??
     req.query['participantToken'];
+  const token = typeof ptokRaw === 'string' && ptokRaw.trim().length > 0 ? ptokRaw : null;
 
-  if (typeof ptok !== 'string' || ptok.trim().length === 0) {
-    res.status(401).json({ error: 'participantToken is required' });
+  if (!token && !(req as AuthedRequest).auth) {
+    res.status(401).json({ error: 'participantToken or admin authentication is required' });
     return;
   }
 
-  const roomId = await validateSeatOwnership(roomCode, seatId, ptok);
+  const roomId = await validateSeatOwnership(req, roomCode, seatId, token);
   if (!roomId) {
     res.status(403).json({ error: 'Forbidden: invalid token or seat not found in this room' });
     return;
@@ -149,8 +145,9 @@ export async function updateDeathCount(req: Request, res: Response, io: Server):
   const { roomCode, seatId } = req.params as { roomCode: string; seatId: string };
   const { delta, participantToken } = req.body as { delta?: unknown; participantToken?: unknown };
 
-  if (typeof participantToken !== 'string' || participantToken.trim().length === 0) {
-    res.status(401).json({ error: 'participantToken is required' });
+  const token = typeof participantToken === 'string' && participantToken.trim().length > 0 ? participantToken : null;
+  if (!token && !(req as AuthedRequest).auth) {
+    res.status(401).json({ error: 'participantToken or admin authentication is required' });
     return;
   }
   const d = Number(delta);
@@ -159,7 +156,7 @@ export async function updateDeathCount(req: Request, res: Response, io: Server):
     return;
   }
 
-  const roomId = await validateSeatOwnership(roomCode, seatId, participantToken);
+  const roomId = await validateSeatOwnership(req, roomCode, seatId, token);
   if (!roomId) {
     res.status(403).json({ error: 'Forbidden: invalid token or seat not found in this room' });
     return;

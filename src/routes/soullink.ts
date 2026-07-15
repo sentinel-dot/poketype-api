@@ -3,7 +3,7 @@ import { Server } from 'socket.io';
 import { createRoom, getRoom, updateRoomSettings, inviteToRoom } from '../controllers/soullink/rooms';
 import { joinRoom, leaveRoom } from '../controllers/soullink/join';
 import { updateSlot, clearSlot, clearAllSlots, updateDeathCount } from '../controllers/soullink/teamSlots';
-import { addEncounter, removeEncounter, getFamilyKey } from '../controllers/soullink/encounters';
+import { getFamilyKey } from '../controllers/soullink/encounters';
 import { getLiveKitToken } from '../controllers/soullink/livekit';
 import { optionalAuth, requireAuth } from '../middleware/auth';
 
@@ -32,32 +32,31 @@ export function createSoulLinkRouter(io: Server): Router {
   router.post('/rooms/:roomCode/join', optionalAuth, asyncHandler(joinRoom));
   router.post('/rooms/:roomCode/leave', asyncHandler((req, res) => leaveRoom(req, res, io)));
 
-  // Team slot updates
+  // Team slot updates (optionalAuth lets the room owner edit any seat)
   router.patch(
     '/rooms/:roomCode/seats/:seatId/team/:slot',
+    optionalAuth,
     asyncHandler((req, res) => updateSlot(req, res, io)),
   );
   router.delete(
     '/rooms/:roomCode/seats/:seatId/team/:slot',
+    optionalAuth,
     asyncHandler((req, res) => clearSlot(req, res, io)),
   );
   router.delete(
     '/rooms/:roomCode/seats/:seatId/team',
+    optionalAuth,
     asyncHandler((req, res) => clearAllSlots(req, res, io)),
   );
 
   // Death counter (per seat)
   router.patch(
     '/rooms/:roomCode/seats/:seatId/deaths',
+    optionalAuth,
     asyncHandler((req, res) => updateDeathCount(req, res, io)),
   );
 
-  // Dupes registry / encounters
-  router.post('/rooms/:roomCode/encounters', asyncHandler((req, res) => addEncounter(req, res, io)));
-  router.delete(
-    '/rooms/:roomCode/encounters/:familyKey',
-    asyncHandler((req, res) => removeEncounter(req, res, io)),
-  );
+  // Family-key resolver for client-side dupes checks
   router.get('/pokemon/:id/family', asyncHandler(getFamilyKey));
 
   // LiveKit token
